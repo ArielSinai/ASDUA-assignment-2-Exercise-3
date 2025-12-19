@@ -7,3 +7,5 @@ google-genai>=0.3.0
 pandas>=2.0.0
 thefuzz>=0.22.1
 python-Levenshtein>=0.25.0
+annoy>=1.17.3
+
