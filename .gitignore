@@ -209,3 +209,7 @@ __marimo__/
 .env
 generated_ads/
 *.pkl
+embeddings.pkl
+annoy_index.ann
+annoy_meta.json
+generated_ads/

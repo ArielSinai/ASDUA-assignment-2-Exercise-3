@@ -1,6 +1,6 @@
 import os
 import pickle
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
@@ -11,63 +11,52 @@ from openai import OpenAI
 CSV_PATH = "tv_shows.csv"
 PICKLE_PATH = "embeddings.pkl"
 EMBEDDING_MODEL = "text-embedding-3-small"
-
 BATCH_SIZE = 64
 
 
-def _detect_columns(df: pd.DataFrame) -> Tuple[str, str]:
-    """
-    מנסה לזהות עמודות של כותרת ותיאור גם אם השמות ב-CSV קצת שונים.
-    """
-    cols = {c.strip().lower(): c for c in df.columns}
-
-    title_candidates = ["title", "name", "show", "show_title"]
-    desc_candidates = ["description", "desc", "summary", "plot"]
-
-    title_col = next((cols[c] for c in title_candidates if c in cols), None)
-    desc_col = next((cols[c] for c in desc_candidates if c in cols), None)
-
-    if not title_col or not desc_col:
-        raise ValueError(
-            f"Could not detect title/description columns. CSV columns are: {list(df.columns)}"
-        )
-    return title_col, desc_col
+def build_text_for_embedding(genres: str, description: str) -> str:
+    g = (genres or "").strip()
+    d = (description or "").replace("\n", " ").strip()
+    if g and d:
+        return f"Genres: {g}. Description: {d}"
+    return g or d
 
 
 def build_and_save_embeddings(csv_path: str = CSV_PATH, pickle_path: str = PICKLE_PATH) -> None:
-    if os.path.exists(pickle_path):
-        print(f"[OK] {pickle_path} already exists. Not rebuilding (to avoid API calls).")
-        return
-
     load_dotenv()
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is missing. Put it in .env or your environment variables.")
 
-    client = OpenAI(api_key=api_key)
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"Missing {csv_path}. Put the CSV in the project folder.")
 
     df = pd.read_csv(csv_path)
-    title_col, desc_col = _detect_columns(df)
 
-    # ניקוי בסיסי
-    df = df[[title_col, desc_col]].dropna()
-    df[title_col] = df[title_col].astype(str).str.strip()
-    df[desc_col] = df[desc_col].astype(str).str.replace("\n", " ", regex=False).str.strip()
+    required_cols = {"Title", "Description", "Genres"}
+    if not required_cols.issubset(set(df.columns)):
+        raise ValueError(f"CSV must include columns: {sorted(required_cols)}. Found: {list(df.columns)}")
 
-    titles: List[str] = df[title_col].tolist()
-    descriptions: List[str] = df[desc_col].tolist()
+    df = df[["Title", "Genres", "Description"]].dropna(subset=["Title"])
+    df["Title"] = df["Title"].astype(str).str.strip()
+    df["Genres"] = df["Genres"].astype(str)
+    df["Description"] = df["Description"].astype(str)
+
+    titles: List[str] = df["Title"].tolist()
+    texts: List[str] = [
+        build_text_for_embedding(g, d) for g, d in zip(df["Genres"].tolist(), df["Description"].tolist())
+    ]
+
+    client = OpenAI(api_key=api_key)
 
     title_to_embedding: Dict[str, List[float]] = {}
 
-    print(f"Building embeddings for {len(titles)} shows using {EMBEDDING_MODEL} ...")
-
     for i in tqdm(range(0, len(titles), BATCH_SIZE)):
         batch_titles = titles[i : i + BATCH_SIZE]
-        batch_texts = descriptions[i : i + BATCH_SIZE]
+        batch_texts = texts[i : i + BATCH_SIZE]
 
-        
         resp = client.embeddings.create(model=EMBEDDING_MODEL, input=batch_texts)
-        vectors = [item.embedding for item in resp.data]  
+        vectors = [item.embedding for item in resp.data]
 
         for t, v in zip(batch_titles, vectors):
             title_to_embedding[t] = v
@@ -75,7 +64,7 @@ def build_and_save_embeddings(csv_path: str = CSV_PATH, pickle_path: str = PICKL
     with open(pickle_path, "wb") as f:
         pickle.dump(title_to_embedding, f)
 
-    print(f"[DONE] Saved {len(title_to_embedding)} embeddings to {pickle_path}")
+    print(f"[DONE] Saved {len(title_to_embedding)} embeddings to {pickle_path} (based on Genres+Description).")
 
 
 if __name__ == "__main__":
