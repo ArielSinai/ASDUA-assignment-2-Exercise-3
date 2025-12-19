@@ -1,54 +1,19 @@
 
 import os
 import sys
-from typing import List, Tuple, Dict, Optional
+import pickle
+from typing import Dict, List, Tuple
 
-import pandas as pd
+import numpy as np
 from thefuzz import process
 
-from recommender import (
-    load_embeddings,
-    build_user_profile_embedding,
-    top_k_recommendations,
-)
-
-CSV_PATH = "tv_shows.csv"
 PICKLE_PATH = "embeddings.pkl"
-
-TOP_K = 3
-
-
-def detect_title_column(df: pd.DataFrame) -> str:
-    cols = {c.strip().lower(): c for c in df.columns}
-    candidates = ["title", "name", "show", "show_title"]
-    for c in candidates:
-        if c in cols:
-            return cols[c]
-    raise ValueError(f"Could not detect title column. CSV columns are: {list(df.columns)}")
+TOP_K = 5
 
 
-def load_show_titles(csv_path: str = CSV_PATH) -> List[str]:
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(
-            f"Could not find {csv_path}. Put the CSV in your project folder (same folder as this file)."
-        )
-    df = pd.read_csv(csv_path)
-    title_col = detect_title_column(df)
-    titles = (
-        df[title_col]
-        .dropna()
-        .astype(str)
-        .str.strip()
-        .tolist()
-    )
-    
-    seen = set()
-    uniq = []
-    for t in titles:
-        if t and t not in seen:
-            seen.add(t)
-            uniq.append(t)
-    return uniq
+def load_embeddings(pickle_path: str = PICKLE_PATH) -> Dict[str, List[float]]:
+    with open(pickle_path, "rb") as f:
+        return pickle.load(f)
 
 
 def parse_user_input(raw: str) -> List[str]:
@@ -64,19 +29,78 @@ def parse_user_input(raw: str) -> List[str]:
     return uniq
 
 
-def fuzzy_match_shows(
-    user_shows: List[str],
-    all_titles: List[str],
-) -> Tuple[List[str], List[Tuple[str, str, int]]]:
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    a = a / (np.linalg.norm(a) + 1e-12)
+    b = b / (np.linalg.norm(b) + 1e-12)
+    return float(np.dot(a, b))
+
+
+def cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
+    # Distance is smaller when vectors are more similar
+    return 1.0 - cosine_similarity(a, b)
+
+
+def fuzzy_match_shows(user_shows: List[str], valid_titles: List[str]) -> List[str]:
     matched = []
-    debug_info = []
-
-    for user_title in user_shows:
-        best_match, score = process.extractOne(user_title, all_titles)
+    for s in user_shows:
+        best_match, _score = process.extractOne(s, valid_titles)
         matched.append(best_match)
-        debug_info.append((user_title, best_match, int(score)))
+    return matched
 
-    return matched, debug_info
+
+def average_vector(titles: List[str], title_to_embedding: Dict[str, List[float]]) -> np.ndarray:
+    vecs = []
+    missing = []
+    for t in titles:
+        v = title_to_embedding.get(t)
+        if v is None:
+            missing.append(t)
+        else:
+            vecs.append(np.array(v, dtype=np.float32))
+
+    if not vecs:
+        raise ValueError(f"None of the input shows were found in embeddings. Missing: {missing}")
+
+    return np.mean(vecs, axis=0).astype(np.float32)
+
+
+def top_k_by_distance(
+    avg_vec: np.ndarray,
+    title_to_embedding: Dict[str, List[float]],
+    exclude_titles: List[str],
+    k: int = TOP_K,
+) -> List[Tuple[str, float]]:
+    exclude = set(exclude_titles)
+    scored: List[Tuple[str, float]] = []
+
+    for title, emb in title_to_embedding.items():
+        if title in exclude:
+            continue
+        dist = cosine_distance(avg_vec, np.array(emb, dtype=np.float32))
+        scored.append((title, dist))
+
+    scored.sort(key=lambda x: x[1])  # smallest distance first
+    return scored[:k]
+
+
+def distances_to_percentages(top_items: List[Tuple[str, float]]) -> List[Tuple[str, int]]:
+    # Map distances to 0..100 in a way that looks reasonable:
+    # best (smallest distance) -> ~99, worst in top_k -> ~70 (or higher if very close).
+    dists = [d for _, d in top_items]
+    d_min = min(dists)
+    d_max = max(dists)
+
+    results = []
+    for title, d in top_items:
+        if abs(d_max - d_min) < 1e-12:
+            pct = 90
+        else:
+            norm = (d - d_min) / (d_max - d_min)  # 0 best, 1 worst
+            pct = int(round(99 - norm * 29))      # 99..70
+            pct = max(1, min(99, pct))
+        results.append((title, pct))
+
+    return results
 
 
 def ask_yes_no(prompt: str) -> bool:
@@ -84,65 +108,45 @@ def ask_yes_no(prompt: str) -> bool:
     return ans == "y"
 
 
-def format_list_for_confirmation(items: List[str]) -> str:
-    return ", ".join(items)
-
-
 def main():
     if not os.path.exists(PICKLE_PATH):
-        print(
-            f"couldn't find {PICKLE_PATH}. "
-            f"run first: python build_embeddings_cache.py ."
-        )
+        print(f"Missing {PICKLE_PATH}. Run first: python build_embeddings_cache.py (one time).")
         sys.exit(1)
 
-    title_to_embedding: Dict[str, List[float]] = load_embeddings(PICKLE_PATH)
+    title_to_embedding = load_embeddings(PICKLE_PATH)
+    valid_titles = list(title_to_embedding.keys())
 
-    try:
-        all_titles = load_show_titles(CSV_PATH)
-    except Exception as e:
-        print(f"Error reading CSV: {e}")
-        sys.exit(1)
-
+    # Step 1 + Step 2: input + fuzzy match + confirmation loop
     while True:
         print("Which TV shows did you really like watching? Separate them by a comma. Make sure to enter more than 1 show")
         raw = input("> ").strip()
-
         user_shows = parse_user_input(raw)
+
         if len(user_shows) < 2:
             print("Please enter more than 1 show.\n")
             continue
 
-        matched_titles, debug_info = fuzzy_match_shows(user_shows, all_titles)
+        matched_titles = fuzzy_match_shows(user_shows, valid_titles)
+        confirm_list = ", ".join(matched_titles)
 
-        confirm_text = format_list_for_confirmation(matched_titles)
-        ok = ask_yes_no(f"Making sure, do you mean {confirm_text}?(y/n) ")
-
-        if ok:
+        if ask_yes_no(f"Making sure, do you mean {confirm_list}?(y/n) "):
             input_titles = matched_titles
             break
 
         print("Sorry about that. Lets try again, please make sure to write the names of the tv shows correctly\n")
 
+    # Step 3
     print("Great! Generating recommendations now…")
 
-    try:
-        user_profile = build_user_profile_embedding(input_titles, title_to_embedding)
-    except ValueError as e:
-        print(f"Error: {e}")
-        print("Tip: If you changed tv_shows.csv after building embeddings.pkl, rebuild embeddings cache.")
-        sys.exit(1)
+    # Step 4: average vector + loop over all shows + cosine distance + take 5 smallest distances
+    avg_vec = average_vector(input_titles, title_to_embedding)
+    top_items = top_k_by_distance(avg_vec, title_to_embedding, exclude_titles=input_titles, k=TOP_K)
 
-    recs = top_k_recommendations(
-        user_profile,
-        title_to_embedding,
-        exclude_titles=input_titles,
-        k=TOP_K,
-    )
+    # Convert distances to percentages
+    top_with_pct = distances_to_percentages(top_items)
 
     print("Here are the tv shows that i think you would love:")
-    for title, score in recs:
-        pct = round(score * 100)
+    for title, pct in top_with_pct:
         print(f"{title} ({pct}%)")
 
 
